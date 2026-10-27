@@ -9,8 +9,12 @@ Verified against OpenRouter's public docs (Oct 2026):
 - Error body shape: {"error": {"code": <int>, "message": <str>, "metadata": {...}}}
 - Retryable HTTP statuses: 429 (rate limit), 408/524 (timeout), 500/502/503/529
   (upstream/server trouble). 402 (insufficient credits), 401 (auth) and 403
-  (blocked) are NOT retried - retrying them would just burn time and, in the
-  402 case, cannot succeed without the user adding credits.
+  (blocked) are NOT retried by default - retrying them would just burn time
+  and, in the 402 case, usually cannot succeed without the user adding
+  credits. Exception: a 402 whose message mentions "in-flight" requests IS
+  retried - observed in production against a free/low-balance key, this
+  specific variant is a transient per-account concurrent-reservation cap
+  that clears on its own, unlike a genuine zero-balance 402.
 - A client-side read timeout (the request was sent but no response arrived in
   time) is also NOT retried, since OpenRouter may have already generated and
   billed a completion we simply never received - retrying that case risks a
@@ -184,6 +188,26 @@ def chat_completion(
                 return _parse_success(data, latency_ms, retry_count)
             message = _extract_error_message(resp)
             retryable = resp.status_code in RETRYABLE_STATUS_CODES
+            if resp.status_code == 402 and ("in-flight" in message.lower() or "in flight" in message.lower()):
+                # Observed verbatim in production (Oct 2026): "This request
+                # would exceed your available credits given your current
+                # in-flight requests. Retry after in-flight requests settle,
+                # or add credits." A free/low-balance OpenRouter key enforces
+                # a cap on simultaneously in-flight credit reservations,
+                # independent of total balance - unlike a genuine "add
+                # credits" 402, this clears on its own, so it's worth a
+                # backoff retry rather than failing the run outright.
+                #
+                # This is a substring match on free-form error text, not a
+                # structured field - OpenRouter's error body only documents
+                # `code`/`message`/`metadata`, and nothing in what we've
+                # observed indicates a stabler machine-readable signal for
+                # this specific condition. If OpenRouter changes this
+                # wording, this stops matching and the 402 falls back to
+                # non-retryable - safe (never worse than today), just no
+                # longer self-healing for this case. Update the match here
+                # if that's ever observed.
+                retryable = True
             last_error = OpenRouterError(
                 f"HTTP {resp.status_code}: {message}", status_code=resp.status_code, retryable=retryable
             )

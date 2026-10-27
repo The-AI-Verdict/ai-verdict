@@ -5,7 +5,7 @@ import os
 import pandas as pd
 import streamlit as st
 
-from core import db, openrouter_client, runner, ui_common
+from core import analysis, db, openrouter_client, runner, ui_common
 
 st.set_page_config(page_title="Run Experiment - The AI Verdict", layout="wide")
 ui_common.bootstrap()
@@ -23,6 +23,7 @@ with db.get_connection() as conn:
     prompt_versions = db.list_prompt_versions(conn, exp_id, latest_only=True)
     models = db.list_experiment_models(conn, exp_id)
     runs = db.list_runs(conn, exp_id)
+    evaluations_by_run = db.get_latest_evaluations_by_run(conn, exp_id)
 
 st.subheader("Experiment summary")
 c1, c2, c3 = st.columns(3)
@@ -102,15 +103,35 @@ pending = int((df["status"].isin(["pending", "running"])).sum())
 
 st.subheader("Progress")
 st.progress((success + failed) / total if total else 0.0)
-m1, m2, m3, m4 = st.columns(4)
+m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("Total runs", total)
 m2.metric("Success", success)
 m3.metric("Failed", failed)
 m4.metric("Pending", pending)
+# analysis.cost_summary expects "run_status"/"has_evaluation"/
+# "evaluation_cost_usd" columns (the shape of the analysis-flattened rows
+# used everywhere else); this page's df comes straight from db.list_runs,
+# which has none of those - rename run_status and merge in the evaluation
+# cost data rather than reimplementing cost_summary's sum/missing-count
+# logic a second time. Without this, "Cost so far" would silently exclude
+# every evaluator call's cost on exactly the page where it's watched live.
+df["has_evaluation"] = df["id"].map(lambda rid: rid in evaluations_by_run)
+df["evaluation_cost_usd"] = df["id"].map(
+    lambda rid: evaluations_by_run.get(rid, {}).get("cost_usd")
+)
+cost = analysis.cost_summary(df.rename(columns={"status": "run_status"}))
+m5.metric("Cost so far", f"${cost.total_usd:.4f}")
+cost_captions = []
+if cost.runs_missing_cost:
+    cost_captions.append(f"{cost.runs_missing_cost} run(s) with no reported cost")
+if cost.evaluations_missing_cost:
+    cost_captions.append(f"{cost.evaluations_missing_cost} evaluation(s) with no reported cost")
+if cost_captions:
+    m5.caption("+ " + ", ".join(cost_captions))
 
 st.markdown("**By model**")
 by_model = df.groupby("model_id")["status"].value_counts().unstack(fill_value=0)
-st.dataframe(by_model, use_container_width=True)
+st.dataframe(by_model, width='stretch')
 
 if pending > 0:
     extra = runner.estimate_call_count(
@@ -169,4 +190,35 @@ with st.expander("Failed runs (errors kept separate from completed responses)"):
         st.caption("No failures.")
     else:
         st.dataframe(failed_rows[["id", "model_id", "run_number", "error_message", "http_status", "retry_count"]],
-                     use_container_width=True)
+                     width='stretch')
+        with db.get_connection() as conn:
+            already_retried = {r["retried_from_run_id"] for r in db.list_runs(conn, exp_id)
+                                if r["retried_from_run_id"] is not None}
+        retryable_count = int((~failed_rows["id"].isin(already_retried)).sum())
+        if retryable_count > 0:
+            st.caption(f"{retryable_count} of these don't have a retry attempt yet. The original failed "
+                       f"row is never changed - this adds a new attempt, which then needs Start/Resume above.")
+            if st.button(f"Retry {retryable_count} failed run(s)"):
+                with db.get_connection() as conn:
+                    created = runner.retry_failed_runs(conn, exp_id)
+                st.success(f"Created {len(created)} fresh attempt(s) - click Start/Resume to run them.")
+                st.rerun()
+        else:
+            st.caption("Every failed run already has a retry attempt in progress or completed.")
+
+with db.get_connection() as conn:
+    errored_eval_count = runner.count_errored_evaluations(conn, exp_id)
+if errored_eval_count > 0:
+    st.warning(
+        f"{errored_eval_count} successfully-run response(s) have an evaluation that failed with an API "
+        f"error (e.g. a deprecated model id) rather than a validation failure - they were never actually "
+        f"judged. Fix the evaluator model in `.env` or the experiment's override if needed, then retry."
+    )
+    if st.button("Retry errored evaluations", disabled=not key_available):
+        try:
+            api_key = openrouter_client.get_api_key()
+            retried = runner.retry_errored_evaluations(None, exp_id, api_key)
+            st.success(f"Retried {retried} evaluation(s).")
+            st.rerun()
+        except openrouter_client.OpenRouterError as exc:
+            st.error(str(exc))

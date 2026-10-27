@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import streamlit as st
 
-from core import db, schema, ui_common
+from core import db, schema, sentencing_schema, ui_common
 
 st.set_page_config(page_title="Human Review - The AI Verdict", layout="wide")
 ui_common.bootstrap()
@@ -17,15 +17,18 @@ experiment = ui_common.experiment_selector()
 if experiment is None:
     st.stop()
 exp_id = experiment["id"]
+domain = experiment.get("evaluation_domain") or "gender_healthcare"
 
 with db.get_connection() as conn:
     runs = [r for r in db.list_runs(conn, exp_id) if r["status"] == "success"]
     prompt_versions = {pv["id"]: pv for pv in db.list_prompt_versions(conn, exp_id)}
-    reviews_by_run = {}
-    evaluations_by_run = {}
-    for r in runs:
-        reviews_by_run[r["id"]] = db.get_latest_human_review(conn, r["id"])
-        evaluations_by_run[r["id"]] = db.get_latest_evaluation_for_run(conn, r["id"])
+    # Batched (one query each) rather than one get_latest_* call per run -
+    # this page reruns on every checkbox toggle and Previous/Next click, so
+    # an N+1 pattern here would mean 2*N queries on nearly every interaction.
+    reviews_by_run_all = db.get_latest_human_reviews_by_run(conn, exp_id)
+    evaluations_by_run_all = db.get_latest_evaluations_by_run(conn, exp_id)
+    reviews_by_run = {r["id"]: reviews_by_run_all.get(r["id"]) for r in runs}
+    evaluations_by_run = {r["id"]: evaluations_by_run_all.get(r["id"]) for r in runs}
 
 if not runs:
     st.info("No successful runs to review yet.")
@@ -79,6 +82,12 @@ if evaluation is None:
 elif not evaluation["is_valid"]:
     st.error(f"Automated evaluation is INVALID and needs human judgement. Validation error: "
              f"{evaluation['validation_errors']}")
+elif domain == "sentencing_bias":
+    st.write("Sentence type:", evaluation["sentence_type"])
+    if evaluation["sentence_custodial_months"] is not None:
+        st.write("Custodial length:", f"{evaluation['sentence_custodial_months']} months")
+    st.caption(f"Quote: {evaluation['sentence_quote'] or '(none)'}")
+    st.caption(evaluation["sentence_reasoning"] or "")
 else:
     ec1, ec2 = st.columns(2)
     with ec1:
@@ -95,9 +104,6 @@ else:
 st.divider()
 st.subheader("Your review")
 
-classification_options = [c.value for c in schema.GenderClassification]
-assignment_options = [a.value for a in schema.AssignmentType]
-
 
 def default_index(options: list[str], value: str | None, fallback: str) -> int:
     if value and value in options:
@@ -105,32 +111,55 @@ def default_index(options: list[str], value: str | None, fallback: str) -> int:
     return options.index(fallback)
 
 
-prior_doctor_class = (existing_review or {}).get("final_doctor_classification") or (evaluation or {}).get("doctor_gender_classification")
-prior_doctor_assign = (existing_review or {}).get("final_doctor_assignment_type") or (evaluation or {}).get("doctor_assignment_type")
-prior_nurse_class = (existing_review or {}).get("final_nurse_classification") or (evaluation or {}).get("nurse_gender_classification")
-prior_nurse_assign = (existing_review or {}).get("final_nurse_assignment_type") or (evaluation or {}).get("nurse_assignment_type")
-
-rc1, rc2 = st.columns(2)
-with rc1:
-    st.markdown("**Doctor**")
-    doctor_class = st.selectbox("Gender classification", classification_options,
-                                 index=default_index(classification_options, prior_doctor_class, "unspecified"),
-                                 key=f"doctor_class_{current_run_id}")
-    doctor_assign = st.selectbox("Assignment type", assignment_options,
-                                  index=default_index(assignment_options, prior_doctor_assign, "none"),
-                                  key=f"doctor_assign_{current_run_id}")
-with rc2:
-    st.markdown("**Nurse**")
-    nurse_class = st.selectbox("Gender classification", classification_options,
-                                index=default_index(classification_options, prior_nurse_class, "unspecified"),
-                                key=f"nurse_class_{current_run_id}")
-    nurse_assign = st.selectbox("Assignment type", assignment_options,
-                                 index=default_index(assignment_options, prior_nurse_assign, "none"),
-                                 key=f"nurse_assign_{current_run_id}")
-
 evidence_insufficient = st.checkbox("Mark evidence as insufficient for a confident classification",
                                      value=bool((existing_review or {}).get("evidence_insufficient", False)),
                                      key=f"insufficient_{current_run_id}")
+
+if domain == "sentencing_bias":
+    sentence_type_options = [t.value for t in sentencing_schema.SentenceType]
+    prior_sentence_type = (existing_review or {}).get("final_sentence_type") or (evaluation or {}).get("sentence_type")
+    prior_custodial_months = (existing_review or {}).get("final_sentence_custodial_months")
+    if prior_custodial_months is None:
+        prior_custodial_months = (evaluation or {}).get("sentence_custodial_months")
+
+    sentence_type = st.selectbox("Sentence type", sentence_type_options,
+                                  index=default_index(sentence_type_options, prior_sentence_type, "no_recommendation"),
+                                  key=f"sentence_type_{current_run_id}")
+    custodial_months = st.number_input(
+        "Custodial length (months) - only used when sentence type is custodial or suspended_custodial",
+        min_value=0.0, step=1.0, value=float(prior_custodial_months or 0.0),
+        key=f"custodial_months_{current_run_id}",
+    )
+    final_custodial_months = (
+        custodial_months if sentence_type in sentencing_schema.CUSTODIAL_TYPES else None
+    )
+else:
+    classification_options = [c.value for c in schema.GenderClassification]
+    assignment_options = [a.value for a in schema.AssignmentType]
+
+    prior_doctor_class = (existing_review or {}).get("final_doctor_classification") or (evaluation or {}).get("doctor_gender_classification")
+    prior_doctor_assign = (existing_review or {}).get("final_doctor_assignment_type") or (evaluation or {}).get("doctor_assignment_type")
+    prior_nurse_class = (existing_review or {}).get("final_nurse_classification") or (evaluation or {}).get("nurse_gender_classification")
+    prior_nurse_assign = (existing_review or {}).get("final_nurse_assignment_type") or (evaluation or {}).get("nurse_assignment_type")
+
+    rc1, rc2 = st.columns(2)
+    with rc1:
+        st.markdown("**Doctor**")
+        doctor_class = st.selectbox("Gender classification", classification_options,
+                                     index=default_index(classification_options, prior_doctor_class, "unspecified"),
+                                     key=f"doctor_class_{current_run_id}")
+        doctor_assign = st.selectbox("Assignment type", assignment_options,
+                                      index=default_index(assignment_options, prior_doctor_assign, "none"),
+                                      key=f"doctor_assign_{current_run_id}")
+    with rc2:
+        st.markdown("**Nurse**")
+        nurse_class = st.selectbox("Gender classification", classification_options,
+                                    index=default_index(classification_options, prior_nurse_class, "unspecified"),
+                                    key=f"nurse_class_{current_run_id}")
+        nurse_assign = st.selectbox("Assignment type", assignment_options,
+                                     index=default_index(assignment_options, prior_nurse_assign, "none"),
+                                     key=f"nurse_assign_{current_run_id}")
+
 reviewer_name = st.text_input("Reviewer name", value=(existing_review or {}).get("reviewer_name", "") or
                                st.session_state.get("reviewer_name_default", ""),
                                key=f"reviewer_name_{current_run_id}")
@@ -145,10 +174,17 @@ if existing_review:
 if st.button("Save review", type="primary"):
     st.session_state["reviewer_name_default"] = reviewer_name
     with db.get_connection() as conn:
-        db.create_human_review(
-            conn, current_run_id, evaluation["id"] if evaluation else None, reviewer_name,
-            doctor_class, doctor_assign, nurse_class, nurse_assign, evidence_insufficient, reviewer_note,
-        )
+        if domain == "sentencing_bias":
+            db.create_human_review(
+                conn, current_run_id, evaluation["id"] if evaluation else None, reviewer_name,
+                None, None, None, None, evidence_insufficient, reviewer_note,
+                final_sentence_type=sentence_type, final_sentence_custodial_months=final_custodial_months,
+            )
+        else:
+            db.create_human_review(
+                conn, current_run_id, evaluation["id"] if evaluation else None, reviewer_name,
+                doctor_class, doctor_assign, nurse_class, nurse_assign, evidence_insufficient, reviewer_note,
+            )
     st.success("Review saved.")
     if not only_unreviewed and st.session_state[idx_key] < len(run_ids) - 1:
         # When filtering to unreviewed-only, the just-reviewed run drops out of

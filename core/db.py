@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS experiments (
     extra_params_json TEXT NOT NULL DEFAULT '{}',
     reveal_hypothesis_to_model INTEGER NOT NULL DEFAULT 0,
     evaluator_model_id TEXT,
+    evaluation_domain TEXT NOT NULL DEFAULT 'gender_healthcare',
     status TEXT NOT NULL DEFAULT 'draft',
     source_experiment_id INTEGER,
     created_at TEXT NOT NULL,
@@ -118,7 +119,8 @@ CREATE TABLE IF NOT EXISTS runs (
     http_status INTEGER,
     started_at TEXT,
     completed_at TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    retried_from_run_id INTEGER REFERENCES runs(id)
 );
 
 CREATE TABLE IF NOT EXISTS evaluations (
@@ -140,6 +142,12 @@ CREATE TABLE IF NOT EXISTS evaluations (
     nurse_reasoning TEXT,
     uncertain INTEGER NOT NULL DEFAULT 0,
     uncertain_reason TEXT,
+    sentence_type TEXT,
+    sentence_custodial_months REAL,
+    sentence_quote TEXT,
+    sentence_reasoning TEXT,
+    sentence_no_recommendation INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL,
     attempt_number INTEGER NOT NULL DEFAULT 1,
     status TEXT NOT NULL DEFAULT 'pending',
     created_at TEXT NOT NULL
@@ -154,6 +162,8 @@ CREATE TABLE IF NOT EXISTS human_reviews (
     final_doctor_assignment_type TEXT,
     final_nurse_classification TEXT,
     final_nurse_assignment_type TEXT,
+    final_sentence_type TEXT,
+    final_sentence_custodial_months REAL,
     evidence_insufficient INTEGER NOT NULL DEFAULT 0,
     reviewer_note TEXT NOT NULL DEFAULT '',
     is_latest INTEGER NOT NULL DEFAULT 1,
@@ -182,6 +192,40 @@ CREATE INDEX IF NOT EXISTS idx_human_reviews_run ON human_reviews(run_id, is_lat
 def init_db(db_path: str | Path | None = None) -> None:
     with get_connection(db_path) as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """CREATE TABLE IF NOT EXISTS never alters an already-existing table, so
+    a column added to SCHEMA after a database was first created needs an
+    explicit, idempotent ALTER TABLE here too - otherwise anyone with an
+    existing database silently never gets the new column."""
+    run_cols = {row["name"] for row in conn.execute("PRAGMA table_info(runs)")}
+    if "retried_from_run_id" not in run_cols:
+        conn.execute("ALTER TABLE runs ADD COLUMN retried_from_run_id INTEGER REFERENCES runs(id)")
+
+    experiment_cols = {row["name"] for row in conn.execute("PRAGMA table_info(experiments)")}
+    if "evaluation_domain" not in experiment_cols:
+        conn.execute("ALTER TABLE experiments ADD COLUMN evaluation_domain TEXT NOT NULL DEFAULT 'gender_healthcare'")
+
+    eval_cols = {row["name"] for row in conn.execute("PRAGMA table_info(evaluations)")}
+    for col_sql in (
+        "sentence_type TEXT",
+        "sentence_custodial_months REAL",
+        "sentence_quote TEXT",
+        "sentence_reasoning TEXT",
+        "sentence_no_recommendation INTEGER NOT NULL DEFAULT 0",
+        "cost_usd REAL",
+    ):
+        col_name = col_sql.split()[0]
+        if col_name not in eval_cols:
+            conn.execute(f"ALTER TABLE evaluations ADD COLUMN {col_sql}")
+
+    review_cols = {row["name"] for row in conn.execute("PRAGMA table_info(human_reviews)")}
+    for col_sql in ("final_sentence_type TEXT", "final_sentence_custodial_months REAL"):
+        col_name = col_sql.split()[0]
+        if col_name not in review_cols:
+            conn.execute(f"ALTER TABLE human_reviews ADD COLUMN {col_sql}")
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -212,6 +256,7 @@ def create_experiment(
     extra_params: dict | None = None,
     reveal_hypothesis_to_model: bool = False,
     evaluator_model_id: str | None = None,
+    evaluation_domain: str = "gender_healthcare",
     source_experiment_id: int | None = None,
 ) -> int:
     ts = now_iso()
@@ -220,15 +265,15 @@ def create_experiment(
         INSERT INTO experiments
             (name, hypothesis, description, repetitions, randomize_order,
              temperature, max_tokens, top_p, frequency_penalty, presence_penalty,
-             seed, extra_params_json, reveal_hypothesis_to_model, evaluator_model_id, status,
-             source_experiment_id, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)
+             seed, extra_params_json, reveal_hypothesis_to_model, evaluator_model_id, evaluation_domain,
+             status, source_experiment_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)
         """,
         (
             name, hypothesis, description, repetitions, int(randomize_order),
             temperature, max_tokens, top_p, frequency_penalty, presence_penalty,
             seed, json.dumps(extra_params or {}), int(reveal_hypothesis_to_model), evaluator_model_id,
-            source_experiment_id, ts, ts,
+            evaluation_domain, source_experiment_id, ts, ts,
         ),
     )
     return cur.lastrowid
@@ -393,16 +438,17 @@ def create_run(
     sequence_number: int,
     request_params: dict,
     unsupported_params: list[str] | None = None,
+    retried_from_run_id: int | None = None,
 ) -> int:
     cur = conn.execute(
         """
         INSERT INTO runs
             (experiment_id, prompt_version_id, model_id, run_number, sequence_number,
-             status, request_params_json, unsupported_params_json, created_at)
-        VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+             status, request_params_json, unsupported_params_json, retried_from_run_id, created_at)
+        VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
         """,
         (experiment_id, prompt_version_id, model_id, run_number, sequence_number,
-         json.dumps(request_params), json.dumps(unsupported_params or []), now_iso()),
+         json.dumps(request_params), json.dumps(unsupported_params or []), retried_from_run_id, now_iso()),
     )
     return cur.lastrowid
 
@@ -508,6 +554,7 @@ def update_evaluation_result(
     is_valid: bool,
     validation_errors: str | None,
     parsed: dict | None,
+    cost_usd: float | None = None,
 ) -> None:
     doctor = (parsed or {}).get("doctor", {})
     nurse = (parsed or {}).get("nurse", {})
@@ -518,7 +565,7 @@ def update_evaluation_result(
             raw_evaluator_response = ?, parsed_json = ?, is_valid = ?, validation_errors = ?,
             doctor_gender_classification = ?, doctor_assignment_type = ?, doctor_quote = ?, doctor_reasoning = ?,
             nurse_gender_classification = ?, nurse_assignment_type = ?, nurse_quote = ?, nurse_reasoning = ?,
-            uncertain = ?, uncertain_reason = ?, status = ?
+            uncertain = ?, uncertain_reason = ?, cost_usd = ?, status = ?
         WHERE id = ?
         """,
         (
@@ -526,7 +573,34 @@ def update_evaluation_result(
             doctor.get("gender_classification"), doctor.get("assignment_type"), doctor.get("quote"), doctor.get("reasoning"),
             nurse.get("gender_classification"), nurse.get("assignment_type"), nurse.get("quote"), nurse.get("reasoning"),
             int((parsed or {}).get("uncertain", False)), (parsed or {}).get("uncertain_reason"),
-            status, evaluation_id,
+            cost_usd, status, evaluation_id,
+        ),
+    )
+
+
+def update_sentencing_evaluation_result(
+    conn: sqlite3.Connection,
+    evaluation_id: int,
+    raw_evaluator_response: str,
+    is_valid: bool,
+    validation_errors: str | None,
+    parsed: dict | None,
+    cost_usd: float | None = None,
+) -> None:
+    status = "valid" if is_valid else "invalid_needs_review"
+    p = parsed or {}
+    conn.execute(
+        """
+        UPDATE evaluations SET
+            raw_evaluator_response = ?, parsed_json = ?, is_valid = ?, validation_errors = ?,
+            sentence_type = ?, sentence_custodial_months = ?, sentence_quote = ?, sentence_reasoning = ?,
+            sentence_no_recommendation = ?, cost_usd = ?, status = ?
+        WHERE id = ?
+        """,
+        (
+            raw_evaluator_response, json.dumps(parsed) if parsed else None, int(is_valid), validation_errors,
+            p.get("sentence_type"), p.get("custodial_months"), p.get("quote"), p.get("reasoning"),
+            int(p.get("sentence_type") == "no_recommendation"), cost_usd, status, evaluation_id,
         ),
     )
 
@@ -546,16 +620,35 @@ def get_latest_evaluation_for_run(conn: sqlite3.Connection, run_id: int) -> dict
 
 
 def list_evaluations_for_experiment(conn: sqlite3.Connection, experiment_id: int) -> list[dict[str, Any]]:
+    """Ordered so the first row seen per run_id is the latest evaluation
+    attempt. attempt_number alone is not a reliable tiebreaker - nothing in
+    this codebase currently increments it on retry (every retry is recorded
+    as attempt_number=1), so id DESC is the real recency signal; without it,
+    SQLite's tie order is unspecified and callers like
+    analysis.build_experiment_rows (which keeps the first row per run_id via
+    setdefault) could silently pick a stale, superseded evaluation."""
     rows = conn.execute(
         """
         SELECT e.* FROM evaluations e
         JOIN runs r ON r.id = e.run_id
         WHERE r.experiment_id = ?
-        ORDER BY e.run_id, e.attempt_number DESC
+        ORDER BY e.run_id, e.attempt_number DESC, e.id DESC
         """,
         (experiment_id,),
     ).fetchall()
     return rows_to_dicts(rows)
+
+
+def get_latest_evaluations_by_run(conn: sqlite3.Connection, experiment_id: int) -> dict[int, dict[str, Any]]:
+    """One evaluation per run_id - the most recent attempt - built from a
+    single JOINed query instead of one query per run (get_latest_evaluation_
+    for_run). Use this whenever you need the latest evaluation for more than
+    one run in an experiment; analysis.py, runner.py, and the Human Review
+    page all need exactly this, so it lives here once instead of three times."""
+    latest: dict[int, dict[str, Any]] = {}
+    for ev in list_evaluations_for_experiment(conn, experiment_id):
+        latest.setdefault(ev["run_id"], ev)
+    return latest
 
 
 # ---------------------------------------------------------------------------
@@ -573,19 +666,21 @@ def create_human_review(
     final_nurse_assignment_type: str | None,
     evidence_insufficient: bool,
     reviewer_note: str,
+    final_sentence_type: str | None = None,
+    final_sentence_custodial_months: float | None = None,
 ) -> int:
     conn.execute("UPDATE human_reviews SET is_latest = 0 WHERE run_id = ?", (run_id,))
     cur = conn.execute(
         """
         INSERT INTO human_reviews
             (run_id, evaluation_id, reviewer_name, final_doctor_classification, final_doctor_assignment_type,
-             final_nurse_classification, final_nurse_assignment_type, evidence_insufficient, reviewer_note,
-             is_latest, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+             final_nurse_classification, final_nurse_assignment_type, final_sentence_type,
+             final_sentence_custodial_months, evidence_insufficient, reviewer_note, is_latest, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
         """,
         (run_id, evaluation_id, reviewer_name, final_doctor_classification, final_doctor_assignment_type,
-         final_nurse_classification, final_nurse_assignment_type, int(evidence_insufficient), reviewer_note,
-         now_iso()),
+         final_nurse_classification, final_nurse_assignment_type, final_sentence_type,
+         final_sentence_custodial_months, int(evidence_insufficient), reviewer_note, now_iso()),
     )
     return cur.lastrowid
 
@@ -614,6 +709,12 @@ def list_human_reviews_for_experiment(conn: sqlite3.Connection, experiment_id: i
         (experiment_id,),
     ).fetchall()
     return rows_to_dicts(rows)
+
+
+def get_latest_human_reviews_by_run(conn: sqlite3.Connection, experiment_id: int) -> dict[int, dict[str, Any]]:
+    """run_id -> its current (is_latest) human review, from one query
+    instead of one call to get_latest_human_review per run."""
+    return {hr["run_id"]: hr for hr in list_human_reviews_for_experiment(conn, experiment_id)}
 
 
 # ---------------------------------------------------------------------------

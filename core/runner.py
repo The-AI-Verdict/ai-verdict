@@ -6,13 +6,14 @@ success or failure.
 """
 from __future__ import annotations
 
+import json
 import random
 import sqlite3
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from core import db, evaluator, openrouter_client
+from core import db, evaluator, openrouter_client, sentencing_evaluator
 
 GENERATION_PARAM_NAMES = [
     "temperature", "max_tokens", "top_p", "frequency_penalty", "presence_penalty", "seed",
@@ -29,7 +30,6 @@ def compute_unsupported_params(experiment: dict[str, Any], cached_model: dict[st
     requested = [p for p in GENERATION_PARAM_NAMES if experiment.get(p) is not None]
     if not cached_model:
         return []
-    import json
     supported = set(json.loads(cached_model.get("supported_parameters_json") or "[]"))
     if not supported:
         return []
@@ -107,14 +107,108 @@ def _runs_needing_evaluation(conn: sqlite3.Connection, experiment_id: int) -> li
     mirroring how _reset_stale_running recovers a crashed run attempt. Only
     called when run_evaluation=True, so a deliberate per-call opt-out of
     evaluation (used in tests) never triggers this sweep."""
+    latest_by_run = db.get_latest_evaluations_by_run(conn, experiment_id)
     needing = []
     for run in db.list_runs(conn, experiment_id):
         if run["status"] != "success":
             continue
-        latest = db.get_latest_evaluation_for_run(conn, run["id"])
+        latest = latest_by_run.get(run["id"])
         if latest is None or latest["status"] == "pending":
             needing.append(run)
     return needing
+
+
+def count_errored_evaluations(conn: sqlite3.Connection, experiment_id: int) -> int:
+    """Successful runs whose most recent evaluation ended in status='error' -
+    the evaluator API call itself failed (bad/deprecated model id, rate
+    limit exhausted, etc.), as opposed to 'invalid_needs_review' (the
+    evaluator responded but its output failed validation, which is correctly
+    routed to a human rather than auto-retried)."""
+    latest_by_run = db.get_latest_evaluations_by_run(conn, experiment_id)
+    count = 0
+    for run in db.list_runs(conn, experiment_id):
+        if run["status"] != "success":
+            continue
+        latest = latest_by_run.get(run["id"])
+        if latest is not None and latest["status"] == "error":
+            count += 1
+    return count
+
+
+def retry_failed_runs(conn: sqlite3.Connection, experiment_id: int) -> list[int]:
+    """Creates a fresh pending run for every currently-failed run in this
+    experiment that doesn't already have a retry (same prompt version,
+    model, and request params), so it gets picked up by the normal
+    pending-run execution flow. The original failed row is never touched -
+    the failure stays in the audit trail exactly as it happened; this only
+    adds a new attempt with a new run_number, linked back via
+    retried_from_run_id, the same way a human would if they re-ran a single
+    cell by hand (this is exactly what had to be done manually, via a
+    one-off script, for 20 truncated Gemini runs before this function
+    existed). Calling this again before re-executing is a safe no-op - a
+    failed run that already has a pending/running/successful retry is
+    skipped, so repeated clicks don't pile up duplicate retries."""
+    all_runs = db.list_runs(conn, experiment_id)
+    already_retried_ids = {r["retried_from_run_id"] for r in all_runs if r["retried_from_run_id"] is not None}
+    failed_runs = [r for r in all_runs if r["status"] == "failed" and r["id"] not in already_retried_ids]
+    if not failed_runs:
+        return []
+
+    next_seq = max((r["sequence_number"] for r in all_runs), default=0) + 1
+    max_run_number: dict[tuple[int, str], int] = {}
+    for r in all_runs:
+        key = (r["prompt_version_id"], r["model_id"])
+        max_run_number[key] = max(max_run_number.get(key, 0), r["run_number"])
+
+    created = []
+    for r in failed_runs:
+        key = (r["prompt_version_id"], r["model_id"])
+        max_run_number[key] += 1
+        new_id = db.create_run(
+            conn, experiment_id, r["prompt_version_id"], r["model_id"],
+            run_number=max_run_number[key], sequence_number=next_seq,
+            request_params=json.loads(r["request_params_json"]),
+            retried_from_run_id=r["id"],
+            unsupported_params=json.loads(r["unsupported_params_json"] or "[]"),
+        )
+        created.append(new_id)
+        next_seq += 1
+    return created
+
+
+def retry_errored_evaluations(
+    db_path: str | None, experiment_id: int, api_key: str, delay_seconds: float = 0.5,
+) -> int:
+    """Re-attempts evaluation for every successful run whose most recent
+    evaluation ended in status='error' - e.g. after fixing a deprecated
+    evaluator model id. Each retry creates a new evaluation attempt; the
+    failed one is preserved, not overwritten. Returns the number retried.
+
+    A small delay is inserted between calls: free-tier / low-spend
+    OpenRouter keys enforce a per-account cap on simultaneously in-flight
+    credit reservations, independent of total balance. Firing many
+    evaluation calls back-to-back with no pacing can trip "would exceed your
+    available credits given your current in-flight requests" even when the
+    account has ample balance - this showed up in practice retrying 150
+    evaluations at once."""
+    with db.get_connection(db_path) as conn:
+        latest_by_run = db.get_latest_evaluations_by_run(conn, experiment_id)
+        to_retry = []
+        for run in db.list_runs(conn, experiment_id):
+            if run["status"] != "success":
+                continue
+            latest = latest_by_run.get(run["id"])
+            if latest is not None and latest["status"] == "error":
+                to_retry.append(run)
+        prompt_versions = {pv["id"]: pv for pv in db.list_prompt_versions(conn, experiment_id)}
+
+    for i, run in enumerate(to_retry):
+        if i > 0 and delay_seconds > 0:
+            time.sleep(delay_seconds)
+        prompt_version = prompt_versions[run["prompt_version_id"]]
+        _evaluate_run(db_path, run["id"], prompt_version["prompt_text"], run["raw_response"], api_key)
+
+    return len(to_retry)
 
 
 def _order_pending_runs(conn: sqlite3.Connection, experiment_id: int, randomize: bool) -> list[dict[str, Any]]:
@@ -185,7 +279,6 @@ def _execute_single_run(
     api_key: str,
     run_evaluation: bool,
 ) -> RunOutcome:
-    import json
     params = json.loads(run["request_params_json"])
     messages = [{"role": "user", "content": prompt_version["prompt_text"]}]
 
@@ -263,16 +356,31 @@ def execute_one_pending_run(
 
 
 def _evaluate_run(db_path: str | None, run_id: int, original_prompt: str, response_text: str, api_key: str) -> None:
+    """Dispatches to the gender-healthcare or sentencing-bias evaluator based
+    on the owning experiment's evaluation_domain. Both domains share the same
+    generic run/retry/pause-resume machinery above this function - only the
+    evaluator call and the result-persisting write differ."""
     with db.get_connection(db_path) as conn:
         experiment_row = conn.execute(
-            "SELECT e.evaluator_model_id FROM runs r JOIN experiments e ON e.id = r.experiment_id WHERE r.id = ?",
+            "SELECT e.evaluator_model_id, e.evaluation_domain FROM runs r "
+            "JOIN experiments e ON e.id = r.experiment_id WHERE r.id = ?",
             (run_id,),
         ).fetchone()
+        domain = (experiment_row["evaluation_domain"] if experiment_row else None) or "gender_healthcare"
         evaluator_model = (experiment_row["evaluator_model_id"] if experiment_row else None) or evaluator.default_evaluator_model()
-        evaluation_id = db.create_evaluation(conn, run_id, evaluator_model, evaluator.EVALUATOR_PROMPT_VERSION)
+        prompt_version_tag = (
+            sentencing_evaluator.SENTENCING_EVALUATOR_PROMPT_VERSION if domain == "sentencing_bias"
+            else evaluator.EVALUATOR_PROMPT_VERSION
+        )
+        evaluation_id = db.create_evaluation(conn, run_id, evaluator_model, prompt_version_tag)
 
     try:
-        outcome = evaluator.evaluate_response(original_prompt, response_text, evaluator_model, api_key=api_key)
+        if domain == "sentencing_bias":
+            outcome = sentencing_evaluator.evaluate_sentencing_response(
+                original_prompt, response_text, evaluator_model, api_key=api_key,
+            )
+        else:
+            outcome = evaluator.evaluate_response(original_prompt, response_text, evaluator_model, api_key=api_key)
     except openrouter_client.OpenRouterError as exc:
         with db.get_connection(db_path) as conn:
             db.mark_evaluation_error(conn, evaluation_id, str(exc))
@@ -280,4 +388,13 @@ def _evaluate_run(db_path: str | None, run_id: int, original_prompt: str, respon
 
     with db.get_connection(db_path) as conn:
         parsed_dict = outcome.parsed.model_dump() if outcome.parsed else None
-        db.update_evaluation_result(conn, evaluation_id, outcome.raw_text, outcome.is_valid, outcome.error, parsed_dict)
+        if domain == "sentencing_bias":
+            db.update_sentencing_evaluation_result(
+                conn, evaluation_id, outcome.raw_text, outcome.is_valid, outcome.error, parsed_dict,
+                cost_usd=outcome.cost_usd,
+            )
+        else:
+            db.update_evaluation_result(
+                conn, evaluation_id, outcome.raw_text, outcome.is_valid, outcome.error, parsed_dict,
+                cost_usd=outcome.cost_usd,
+            )

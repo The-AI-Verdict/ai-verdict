@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import streamlit as st
 
-from core import db, runner, seed, ui_common
+from core import db, runner, seed, sentencing_seed, ui_common
 
 st.set_page_config(page_title="The AI Verdict - Experiments", layout="wide")
 ui_common.bootstrap()
@@ -20,7 +20,8 @@ def _duplicate_experiment(conn, experiment_id: int) -> int:
         repetitions=src["repetitions"], randomize_order=bool(src["randomize_order"]),
         temperature=src["temperature"], max_tokens=src["max_tokens"], top_p=src["top_p"],
         frequency_penalty=src["frequency_penalty"], presence_penalty=src["presence_penalty"], seed=src["seed"],
-        evaluator_model_id=src["evaluator_model_id"], source_experiment_id=experiment_id,
+        evaluator_model_id=src["evaluator_model_id"], evaluation_domain=src["evaluation_domain"],
+        source_experiment_id=experiment_id,
     )
     for pv in db.list_prompt_versions(conn, experiment_id, latest_only=True):
         db.create_prompt_version(conn, new_id, pv["variant_name"], pv["prompt_text"], notes=pv["notes"],
@@ -35,9 +36,9 @@ if not ui_common.api_key_configured():
         "requires an API key in `.env` - see `.env.example` and the **Settings** page."
     )
 
-col_a, col_b = st.columns(2)
+col_a, col_b, col_c, col_d = st.columns(4)
 with col_a:
-    if st.button("Load built-in sample experiment", use_container_width=True,
+    if st.button("Load gender-bias sample experiment", use_container_width=True,
                   help='Seeds "Do LLMs Assume Nurses Are Women?" with its baseline, role-reversed and '
                        'alternative-profession prompt variants.'):
         with db.get_connection() as conn:
@@ -46,6 +47,25 @@ with col_a:
         st.success(f"Sample experiment ready (id #{exp_id}). Open **Create Experiment** to pick models, "
                    f"or **Run Experiment** if models are already selected.")
 with col_b:
+    if st.button("Load sentencing-bias sample experiment", use_container_width=True,
+                  help='Seeds "The AI judge gave him a longer sentence." with its baseline, name-swap and '
+                       'three dialect prompt variants.'):
+        with db.get_connection() as conn:
+            exp_id = sentencing_seed.create_builtin_sentencing_experiment(conn)
+        st.session_state["selected_experiment_id"] = exp_id
+        st.success(f"Sample experiment ready (id #{exp_id}). Open **Create Experiment** to pick models, "
+                   f"or **Run Experiment** if models are already selected.")
+with col_c:
+    if st.button("Load name/nationality sample experiment", use_container_width=True,
+                  help='Seeds "Would he get the same sentence with a different name?" - same case and '
+                       'statement as the sentencing-bias sample, only the defendant\'s name changes across '
+                       'English, Afghan, Chinese, and Nigerian variants.'):
+        with db.get_connection() as conn:
+            exp_id = sentencing_seed.create_builtin_name_nationality_experiment(conn)
+        st.session_state["selected_experiment_id"] = exp_id
+        st.success(f"Sample experiment ready (id #{exp_id}). Open **Create Experiment** to pick models, "
+                   f"or **Run Experiment** if models are already selected.")
+with col_d:
     st.page_link("pages/1_Create_Experiment.py", label="Create a new experiment", icon=":material/add:")
 
 st.divider()

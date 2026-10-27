@@ -118,6 +118,33 @@ def test_insufficient_credits_402_is_not_retried(monkeypatch):
     assert call_count["n"] == 1
 
 
+def test_in_flight_credit_402_is_retried_since_it_is_transient(monkeypatch):
+    """Observed in production against a free-tier OpenRouter key: this
+    specific 402 variant clears on its own once prior in-flight requests
+    settle, unlike a genuine zero-balance 402 - so it should be retried."""
+    responses = [
+        FakeResponse(402, {"error": {"code": 402, "message": (
+            "This request would exceed your available credits given your current in-flight requests. "
+            "Retry after in-flight requests settle, or add credits."
+        )}}),
+        FakeResponse(200, _success_body()),
+    ]
+    call_count = {"n": 0}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        resp = responses[call_count["n"]]
+        call_count["n"] += 1
+        return resp
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    monkeypatch.setattr(orc.time, "sleep", lambda s: None)
+
+    result = orc.chat_completion("openai/gpt-4o-mini", [{"role": "user", "content": "hi"}], api_key="k",
+                                  backoff_base_seconds=0.01)
+    assert result.content == "Hello world"
+    assert call_count["n"] == 2
+
+
 def test_list_models_returns_data_list(monkeypatch):
     def fake_get(url, headers=None, timeout=None):
         return FakeResponse(200, {"data": [{"id": "openai/gpt-4o-mini", "name": "GPT-4o mini"}]})

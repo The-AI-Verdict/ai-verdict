@@ -1,11 +1,11 @@
 .venv/
 .claude/
+.agents/
 __pycache__/
 *.pyc
 .env
-data/*.db
-data/*.db-journal
-data/exports/
+data/
 .pytest_cache/
 .streamlit/secrets.toml
 *.egg-info/
+*.log

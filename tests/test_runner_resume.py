@@ -121,6 +121,49 @@ def test_failed_api_call_does_not_block_remaining_runs_and_is_recorded_separatel
     assert run["error_message"] is not None
 
 
+def test_retry_failed_runs_creates_fresh_attempts_without_touching_the_original(seeded_experiment, db_path, monkeypatch):
+    call_count = {"n": 0}
+
+    def fake_chat_completion_always_fails(model, messages, api_key=None, **kwargs):
+        call_count["n"] += 1
+        raise openrouter_client.OpenRouterError("HTTP 503: overloaded", status_code=503, retryable=False)
+
+    monkeypatch.setattr(openrouter_client, "chat_completion", fake_chat_completion_always_fails)
+
+    exp_id = seeded_experiment["experiment_id"]
+    with db.get_connection(db_path) as conn:
+        runner.plan_runs(conn, exp_id)  # repetitions=2 in the fixture
+
+    # Run both to failure.
+    runner.execute_one_pending_run(db_path, exp_id, api_key="k", run_evaluation=False)
+    runner.execute_one_pending_run(db_path, exp_id, api_key="k", run_evaluation=False)
+    assert call_count["n"] == 2
+
+    with db.get_connection(db_path) as conn:
+        original_failed = [r for r in db.list_runs(conn, exp_id) if r["status"] == "failed"]
+        assert len(original_failed) == 2
+        original_ids = {r["id"] for r in original_failed}
+
+        created = runner.retry_failed_runs(conn, exp_id)
+        assert len(created) == 2
+        assert not (set(created) & original_ids), "retry must create new rows, never reuse a failed row's id"
+
+        # Original failed rows must be completely untouched.
+        for r in original_failed:
+            still_there = db.get_run(conn, r["id"])
+            assert still_there["status"] == "failed"
+            assert still_there["error_message"] == r["error_message"]
+
+        pending_now = db.get_pending_runs(conn, exp_id)
+        assert len(pending_now) == 2
+        assert {r["id"] for r in pending_now} == set(created)
+
+    # Calling again with nothing failed must be a no-op, not re-retry the retries.
+    with db.get_connection(db_path) as conn:
+        again = runner.retry_failed_runs(conn, exp_id)
+    assert again == []
+
+
 def test_compute_unsupported_params_flags_only_params_the_model_lacks():
     experiment = {"temperature": 0.7, "max_tokens": 300, "top_p": None, "frequency_penalty": None,
                   "presence_penalty": None, "seed": 42}
@@ -182,3 +225,55 @@ def test_compute_unsupported_params_returns_empty_when_catalog_unknown():
     experiment = {"temperature": 0.7, "max_tokens": None, "top_p": None, "frequency_penalty": None,
                   "presence_penalty": None, "seed": None}
     assert runner.compute_unsupported_params(experiment, None) == []
+
+
+def test_retry_errored_evaluations_recovers_from_a_bad_evaluator_model_id(seeded_experiment, db_path, monkeypatch):
+    """Mirrors what actually happened in production: the evaluator model id
+    was deprecated by the provider, so every evaluation call errored out.
+    Fixing the model id and retrying should recover all of them without
+    re-calling the tested model (the raw_response is already stored)."""
+    exp_id = seeded_experiment["experiment_id"]
+    with db.get_connection(db_path) as conn:
+        run_ids = runner.plan_runs(conn, exp_id)
+        for rid in run_ids:
+            db.mark_run_success(conn, rid, fx.NEUTRAL_RESPONSE, "gen-1", "openai/gpt-4o-mini-2024",
+                                 "stop", 10, 5, 15, 0.0001, 100, 0)
+            eval_id = db.create_evaluation(conn, rid, "anthropic/claude-3.5-haiku",
+                                            evaluator.EVALUATOR_PROMPT_VERSION)
+            db.mark_evaluation_error(conn, eval_id,
+                                      "HTTP 404: anthropic/claude-3.5-haiku is no longer available")
+
+    assert len(run_ids) == 2
+    with db.get_connection(db_path) as conn:
+        assert runner.count_errored_evaluations(conn, exp_id) == 2
+
+    parsed = schema.EvaluationResult.model_validate(json.loads(fx.evaluator_json_neutral()))
+    fake_outcome = evaluator.EvaluationOutcome(
+        attempt_number=1, raw_text=fx.evaluator_json_neutral(), parsed=parsed, is_valid=True,
+        error=None, latency_ms=10, retry_count=0,
+    )
+    eval_calls = []
+    tested_model_calls = []
+
+    def fake_evaluate_response(original_prompt, response_under_test, evaluator_model, api_key=None, **kwargs):
+        eval_calls.append(evaluator_model)
+        return fake_outcome
+
+    def fake_chat_completion(model, messages, api_key=None, **kwargs):
+        tested_model_calls.append(model)
+        return _FakeResult()
+
+    monkeypatch.setattr(evaluator, "evaluate_response", fake_evaluate_response)
+    monkeypatch.setattr(openrouter_client, "chat_completion", fake_chat_completion)
+
+    retried = runner.retry_errored_evaluations(db_path, exp_id, api_key="k")
+
+    assert retried == 2
+    assert len(eval_calls) == 2
+    assert len(tested_model_calls) == 0, "retrying evaluation must never re-call the tested model"
+
+    with db.get_connection(db_path) as conn:
+        assert runner.count_errored_evaluations(conn, exp_id) == 0
+        for rid in run_ids:
+            latest = db.get_latest_evaluation_for_run(conn, rid)
+            assert latest["status"] == "valid"

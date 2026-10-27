@@ -17,6 +17,15 @@ if experiment is None:
 exp_id = experiment["id"]
 safe_name = "".join(c if c.isalnum() else "_" for c in experiment["name"])[:40]
 
+if (experiment.get("evaluation_domain") or "gender_healthcare") != "gender_healthcare":
+    st.warning(
+        "CSV export, the Markdown report, the video brief, and the JSON archive are built for the "
+        "gender-healthcare domain only - running them against a sentencing-bias experiment would silently "
+        "report a meaningless 0% 'gender assignment' rate rather than anything about sentencing. For now, "
+        "use the Results Dashboard's 'Raw results table' or query `data/ai_verdict.db` directly."
+    )
+    st.stop()
+
 with db.get_connection() as conn:
     rows = analysis.build_experiment_rows(conn, exp_id)
 df = analysis.rows_to_dataframe(rows)
@@ -29,7 +38,7 @@ st.subheader("Raw data (CSV)")
 csv_text = export.dataframe_to_csv(df)
 st.download_button("Download results CSV", csv_text, file_name=f"{safe_name}_results.csv", mime="text/csv")
 with st.expander("Preview"):
-    st.dataframe(df[[c for c in export.REPORT_COLUMNS if c in df.columns]].head(50), use_container_width=True)
+    st.dataframe(df[[c for c in export.REPORT_COLUMNS if c in df.columns]].head(50), width='stretch')
 
 st.divider()
 st.subheader("Experiment report (Markdown)")

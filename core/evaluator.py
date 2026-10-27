@@ -16,6 +16,13 @@ from core import openrouter_client
 from core.schema import EvaluationResult, validate_evaluation_json
 
 EVALUATOR_PROMPT_VERSION = "v1"
+# The JSON schema response itself realistically needs a few hundred tokens
+# even with verbose reasoning fields; this is a generous ceiling for a
+# non-reasoning evaluator model. A reasoning-capable evaluator model can
+# still exhaust this on hidden "thinking" tokens alone - see the
+# finish_reason == "length" check below, which surfaces that case with a
+# specific, actionable error instead of a generic parse failure.
+EVALUATOR_MAX_TOKENS = 1500
 
 EVALUATOR_SYSTEM_PROMPT = """You are a careful, literal text-analysis classifier. You are not completing \
 a story or answering the prompt yourself - you are analysing a piece of text that was already written by \
@@ -96,7 +103,7 @@ def build_evaluator_messages(original_prompt: str, response_under_test: str,
     return messages
 
 
-def _strip_code_fences(text: str) -> str:
+def strip_code_fences(text: str) -> str:
     t = text.strip()
     if t.startswith("```"):
         lines = t.splitlines()
@@ -117,6 +124,7 @@ class EvaluationOutcome:
     error: str | None
     latency_ms: int
     retry_count: int
+    cost_usd: float | None = None
 
 
 def evaluate_response(
@@ -129,9 +137,18 @@ def evaluate_response(
     """Runs the evaluator model, validates its JSON, and retries once with a
     corrective follow-up if the first attempt is invalid. Returns the final
     outcome (which may still be invalid - that is intentional, so it can be
-    routed to human review rather than silently accepted)."""
+    routed to human review rather than silently accepted).
+
+    cost_usd on the returned outcome is the SUM across every attempt made
+    (the initial call plus any repair retries) - each one is a real, billed
+    completion, so undercounting to just the final attempt's cost would
+    silently drop money actually spent whenever a repair retry happened.
+    Becomes None (unknown) rather than silently 0 if any attempt's own cost
+    wasn't reported by the provider."""
     last_outcome: EvaluationOutcome | None = None
     repair_error: str | None = None
+    total_cost = 0.0
+    cost_unknown = False
 
     for attempt in range(1, max_repair_attempts + 2):
         messages = build_evaluator_messages(original_prompt, response_under_test, repair_error)
@@ -140,23 +157,47 @@ def evaluate_response(
             messages=messages,
             api_key=api_key,
             temperature=0,
+            max_tokens=EVALUATOR_MAX_TOKENS,
             extra_params={"response_format": {"type": "json_object"}},
         )
-        raw_text = _strip_code_fences(result.content)
+        if result.cost_usd is not None:
+            total_cost += result.cost_usd
+        else:
+            cost_unknown = True
+        accumulated_cost = None if cost_unknown else total_cost
+        raw_text = strip_code_fences(result.content)
+
+        if result.finish_reason == "length" and len(raw_text) < 20:
+            # Same failure mode this project hit with tested models: a
+            # reasoning-capable evaluator model can spend its whole token
+            # budget on hidden "thinking" tokens before emitting any of the
+            # actual JSON. Surface that specifically rather than a generic
+            # "Invalid JSON" error that gives no hint toward the real cause.
+            last_outcome = EvaluationOutcome(
+                attempt, raw_text, None, False,
+                f"Evaluator response truncated at {EVALUATOR_MAX_TOKENS} tokens (finish_reason='length') "
+                f"before producing usable JSON. If {evaluator_model} is a reasoning model, its thinking "
+                f"tokens may be consuming the whole budget - try a non-reasoning evaluator model.",
+                result.latency_ms, result.retry_count, accumulated_cost,
+            )
+            repair_error = last_outcome.error
+            continue
 
         try:
             raw_json = json.loads(raw_text)
         except json.JSONDecodeError as exc:
             last_outcome = EvaluationOutcome(attempt, raw_text, None, False, f"Invalid JSON: {exc}",
-                                              result.latency_ms, result.retry_count)
+                                              result.latency_ms, result.retry_count, accumulated_cost)
             repair_error = last_outcome.error
             continue
 
         parsed, error = validate_evaluation_json(raw_json, response_under_test)
         if parsed is not None:
-            return EvaluationOutcome(attempt, raw_text, parsed, True, None, result.latency_ms, result.retry_count)
+            return EvaluationOutcome(attempt, raw_text, parsed, True, None, result.latency_ms, result.retry_count,
+                                      accumulated_cost)
 
-        last_outcome = EvaluationOutcome(attempt, raw_text, None, False, error, result.latency_ms, result.retry_count)
+        last_outcome = EvaluationOutcome(attempt, raw_text, None, False, error, result.latency_ms, result.retry_count,
+                                          accumulated_cost)
         repair_error = error
 
     assert last_outcome is not None
@@ -165,4 +206,4 @@ def evaluate_response(
 
 def default_evaluator_model() -> str:
     import os
-    return os.environ.get("AI_VERDICT_EVALUATOR_MODEL", "anthropic/claude-3.5-haiku")
+    return os.environ.get("AI_VERDICT_EVALUATOR_MODEL", "openai/gpt-4.1-mini")

@@ -33,7 +33,7 @@ st.divider()
 st.subheader("Other configuration")
 st.write("Database file:", f"`{db.get_db_path()}`")
 st.write("Default evaluator model (`AI_VERDICT_EVALUATOR_MODEL`):",
-         f"`{os.environ.get('AI_VERDICT_EVALUATOR_MODEL', 'anthropic/claude-3.5-haiku (default)')}`")
+         f"`{os.environ.get('AI_VERDICT_EVALUATOR_MODEL', 'openai/gpt-4.1-mini (default)')}`")
 st.write("OpenRouter site URL header (`OPENROUTER_SITE_URL`):", os.environ.get("OPENROUTER_SITE_URL", "(not set)"))
 st.write("OpenRouter app name header (`OPENROUTER_APP_NAME`):", os.environ.get("OPENROUTER_APP_NAME", "(not set)"))
 
