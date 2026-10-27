@@ -6,10 +6,10 @@ import streamlit as st
 
 from core import analysis, db, export, ui_common
 
-st.set_page_config(page_title="Export and Video Brief - The AI Verdict", layout="wide")
+st.set_page_config(page_title="Export - The AI Verdict", layout="wide")
 ui_common.bootstrap()
 
-st.title("Export and Video Brief")
+st.title("Export")
 
 experiment = ui_common.experiment_selector()
 if experiment is None:
@@ -19,10 +19,10 @@ safe_name = "".join(c if c.isalnum() else "_" for c in experiment["name"])[:40]
 
 if (experiment.get("evaluation_domain") or "gender_healthcare") != "gender_healthcare":
     st.warning(
-        "CSV export, the Markdown report, the video brief, and the JSON archive are built for the "
-        "gender-healthcare domain only - running them against a sentencing-bias experiment would silently "
-        "report a meaningless 0% 'gender assignment' rate rather than anything about sentencing. For now, "
-        "use the Results Dashboard's 'Raw results table' or query `data/ai_verdict.db` directly."
+        "CSV export, the Markdown report, and the JSON archive are built for the gender-healthcare "
+        "domain only - running them against a sentencing-bias experiment would silently report a "
+        "meaningless 0% 'gender assignment' rate rather than anything about sentencing. For now, use the "
+        "Results Dashboard's 'Raw results table' or query `data/ai_verdict.db` directly."
     )
     st.stop()
 
@@ -47,14 +47,6 @@ with db.get_connection() as conn:
 st.download_button("Download report.md", report_md, file_name=f"{safe_name}_report.md", mime="text/markdown")
 with st.expander("Preview report"):
     st.markdown(report_md)
-
-st.divider()
-st.subheader("YouTube production brief (Markdown)")
-with db.get_connection() as conn:
-    brief_md = export.generate_video_brief(conn, exp_id)
-st.download_button("Download video_brief.md", brief_md, file_name=f"{safe_name}_video_brief.md", mime="text/markdown")
-with st.expander("Preview brief"):
-    st.markdown(brief_md)
 
 st.divider()
 st.subheader("Full experiment archive (JSON)")

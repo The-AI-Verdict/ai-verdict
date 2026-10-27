@@ -3,7 +3,7 @@
 A local, working application for running repeatable, auditable experiments against multiple LLMs
 (via [OpenRouter](https://openrouter.ai)), collecting their raw responses, classifying them with an
 independent structured evaluator, human-reviewing that classification, and exporting an evidence-based
-report + YouTube production brief.
+report.
 
 Built for **The AI Verdict** YouTube channel, starting with *"Do LLMs Assume Nurses Are Women?"* - but the
 app itself is general-purpose, supporting more than one kind of study (`evaluation_domain` on each
@@ -12,9 +12,8 @@ experiment, *"The AI judge gave him a longer sentence,"* tests whether a sentenc
 when only the defendant's name or only his statement's dialect changes - see "Running the sentencing-bias
 sample experiment" below.
 
-No conclusions are hardcoded anywhere. Every number shown on the dashboard, in the exported report, or in
-the video brief is computed from actually recorded model responses and their (human-reviewable)
-classifications.
+No conclusions are hardcoded anywhere. Every number shown on the dashboard or in the exported report is
+computed from actually recorded model responses and their (human-reviewable) classifications.
 
 ## What's in here
 
@@ -25,9 +24,7 @@ pages/
   2_Run_Experiment.py          Plan runs, add/remove models, execute with live progress, pause/resume
   3_Results_Dashboard.py       Filterable results, proportions with 95% CI, disagreements
   4_Human_Review.py            Review raw response + automated classification side by side
-  5_Export_and_Video_Brief.py  CSV / Markdown report / JSON archive / YouTube brief downloads
-  6_Video_Script.py            Full read-on-camera narration script, generated from real results
-  7_Blog_Post.py                Medium-ready blog post draft, generated from real results
+  5_Export.py                  CSV / Markdown report / JSON archive downloads
   8_Settings.py                API key status, model catalog cache, integrity notes
 core/
   db.py                        SQLite schema + all persistence (both evaluation domains)
@@ -41,23 +38,19 @@ core/
   analysis.py                  Domain-agnostic statistics engine (categorical_rate, continuous_stats,
                                 value_distribution + their grouped variants) plus both domains' thin
                                 per-domain wrappers (role_summary, custodial_rate, etc.) - see
-                                "A shared statistics/narrative engine" below
-  export.py                    Gender domain's CSV / report / video brief / narration script / blog post /
-                                JSON archive, plus the domain-agnostic variant-ranking engine
-                                (_rank_variants_by_headline_rate) both domains' narrative generators share
-  sentencing_export.py         Sentencing domain's own Blog Post generator, built on the shared engine
-                                above with its own sentencing-specific prose
+                                "A shared statistics engine" below
+  export.py                    CSV / Markdown report / JSON archive generation (gender domain)
   charts.py                    Matplotlib chart builders for the dashboard
   seed.py                      The built-in "Do LLMs Assume Nurses Are Women?" experiment
   sentencing_seed.py           The built-in "The AI judge gave him a longer sentence." experiment
   ui_common.py                 Shared Streamlit helpers (env bootstrap, experiment selector, etc.)
-tests/                         169 tests - see "Tests" below
+tests/                         139 tests - see "Tests" below
 ```
 
-### A shared statistics/narrative engine
+### A shared statistics engine
 
-Both evaluation domains share the same underlying statistical and narrative-ranking primitives rather
-than each reimplementing its own counting/CI/ranking logic:
+Both evaluation domains share the same underlying statistical primitives rather than each reimplementing
+its own counting/CI logic:
 
 - `analysis.categorical_rate(df, field_col, positive_values)` - a Wilson-CI proportion for any
   categorical field and "which values count as positive" set. `role_summary`'s explicit/implied/any-
@@ -68,18 +61,9 @@ than each reimplementing its own counting/CI/ranking logic:
   field. `sentence_type_distribution` is a wrapper.
 - `analysis.grouped_categorical_rate` / `grouped_continuous_stats` - the same primitives broken out by
   arbitrary grouping columns (`["model_id"]`, `["model_id", "prompt_variant"]`, etc.).
-- `export._rank_variants_by_headline_rate(df, prompt_versions, field_specs)` - decides whether an
-  experiment has a "before vs. after" contrast worth building a two-part narrative around, and which
-  variant to lead with. Both `export._rank_variants_by_assignment_rate` (gender) and
-  `sentencing_export._rank_variants_by_custodial_rate` are one-line calls into this with their own
-  `(field_col, positive_values)` pairs - no per-domain ranking/contrast-detection code.
 
-A third evaluation domain's *statistics and ranking* would need zero new code - just its own field names
-and positive-value sets passed into the primitives above. What's deliberately **not** shared is the
-narrative prose itself (`sentencing_export.generate_blog_post` is hand-written sentencing-specific copy,
-not a generic template) - forcing two very different findings through one sentence template is exactly
-how a report ends up reading like nobody in particular wrote it. See `core/sentencing_export.py`'s module
-docstring for the reasoning.
+A third evaluation domain's statistics would need zero new code - just its own field names and
+positive-value sets passed into the primitives above.
 
 ## Setup
 
@@ -137,15 +121,7 @@ first run.
    result is always preserved alongside your revision.
 7. Go to **Results Dashboard** for proportions (with 95% Wilson confidence intervals and explicit sample
    sizes), filterable by model / prompt variant / review status.
-8. Go to **Export and Video Brief** to download the CSV, the Markdown report, the YouTube production
-   brief, and the full JSON archive.
-9. Go to **Video Script** for a full, read-on-camera narration script built from the same real data -
-   structured as a two-act "spontaneous vs. forced" story with a per-model breakdown when the data
-   supports that contrast, or a simpler single-act structure when it doesn't.
-10. Go to **Blog Post** for a Medium-ready draft - headline options, a dek, and full body copy, built
-    from the same real contrast when there is one. Written to avoid the usual tells of AI-generated
-    prose (hedge-everything, "moreover"/"delve into", rule-of-three lists, uniform paragraph rhythm) by
-    leaning on specific real numbers and quotes instead of generic summary language.
+8. Go to **Export** to download the CSV, the Markdown report, and the full JSON archive.
 
 ## Running the sentencing-bias sample experiment
 
@@ -164,12 +140,9 @@ first run.
 3. The headline comparison is **By prompt variant** on the Results Dashboard: compare `name_only` against
    `baseline` for a pure name effect, and each `dialect_*` variant against `baseline` for a pure dialect
    effect - never combine two variants' effects into one claim, since each only isolates one variable.
-4. **Blog Post** has its own sentencing-domain generator (`core/sentencing_export.py`) - it adapts its
-   structure depending on whether one model dominates every custodial recommendation (the common case) or
-   several do, and names any model with only a handful of stray results explicitly rather than folding it
-   into either group. **Export and Video Brief** and **Video Script** are still gender-domain only for now
-   (see "Known limitations") - for those, read results from the Results Dashboard's "Raw results table"
-   expander, or query `data/ai_verdict.db` directly.
+4. **Export** is still gender-domain only for now (see "Known limitations") - for the sentencing domain,
+   read results from the Results Dashboard's "Raw results table" expander, or query `data/ai_verdict.db`
+   directly.
 
 ## Environment variables
 
@@ -266,7 +239,7 @@ pytest
 pytest -v
 ```
 
-169 tests, no live API calls (everything that would call OpenRouter is mocked via `monkeypatch`). Covers:
+139 tests, no live API calls (everything that would call OpenRouter is mocked via `monkeypatch`). Covers:
 
 - prompt immutability / versioning (`test_db.py`)
 - response persistence, success vs. failure distinction (`test_db.py`)
@@ -277,8 +250,8 @@ pytest -v
 - percentage/denominator correctness, Wilson CI behaviour, exploratory-sample flagging, disagreement
   detection (`test_analysis.py`)
 - human-review overrides and revision history, preserving the original automated result (`test_db.py`)
-- CSV / Markdown report / video brief / JSON archive generation, including the "never fabricate an
-  example" fallback (`test_export.py`)
+- CSV / Markdown report / JSON archive generation, including variant-specific signal not getting averaged
+  away in a multi-variant "by model" breakdown (`test_export.py`)
 - pause/resume, crash recovery, idempotent run planning, no duplicate API calls across a pause/resume
   boundary (`test_runner_resume.py`)
 - sentencing-domain schema validation, including the custodial-months/sentence-type consistency rules
@@ -294,11 +267,6 @@ pytest -v
 - the domain-agnostic statistics primitives directly - categorical_rate, continuous_stats,
   value_distribution and their grouped variants, plus a regression guard confirming role_summary's
   numbers didn't change when it was rewritten to use them (`test_generic_analysis.py`)
-- the sentencing Blog Post generator: never fabricates a percentage (every number is checked against
-  `analysis.summarize_sentencing_by`'s own output), multi-line quoted responses get `>` on every line
-  (not just the first), and a model with only a stray custodial result or two is named explicitly rather
-  than silently folded into either the dominant model's story or the fully-silent group
-  (`test_sentencing_export.py`)
 - the built-in name/nationality experiment's one-variable-at-a-time design: every variant differs from
   baseline in exactly the defendant's name, the statement's wording is byte-identical across all four
   (no dialect confound this time), and neither of the two real identifiable names from an earlier draft
@@ -328,12 +296,10 @@ deterministically.
   automated output is never treated as ground truth anywhere in the dashboard, exports, or reports.
 - This is a local, single-user tool (SQLite, short-lived connections per Streamlit rerun). It is not
   designed for concurrent multi-user access.
-- **CSV/Markdown export, the video brief, and the narration script are all gender-domain only.** Each
-  checks the experiment's `evaluation_domain` and refuses to run against a sentencing-bias experiment
-  (rather than silently generating a nonsensical "0% gender assignment" report) - that reporting hasn't
-  been built for the sentencing domain yet. The **Blog Post** generator is the exception - it has its own
-  sentencing-domain version (`core/sentencing_export.py`). For the other three, use the Results
-  Dashboard's "Raw results table" or query `data/ai_verdict.db` directly in the meantime.
+- **CSV/Markdown export is gender-domain only.** It checks the experiment's `evaluation_domain` and
+  refuses to run against a sentencing-bias experiment (rather than silently generating a nonsensical "0%
+  gender assignment" report) - that reporting hasn't been built for the sentencing domain yet. Use the
+  Results Dashboard's "Raw results table" or query `data/ai_verdict.db` directly in the meantime.
 - **(Fixed) Matplotlib figures were leaking into pyplot's global state.** `core/charts.py`'s three chart
   functions called `plt.subplots()` but never `plt.close(fig)`, so every chart ever rendered stayed
   registered in matplotlib's global figure manager for the life of the process. In a long-running
